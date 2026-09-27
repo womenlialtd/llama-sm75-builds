@@ -1,0 +1,348 @@
+name: llama.cpp Windows CUDA sm_75 Build
+
+# =============================================================================
+# 纯 workflow 仓库 —— 本仓库不含 llama.cpp 源码。
+# 构建时直接检出上游 ggml-org/llama.cpp 的固定 tag，编出只含 sm_75
+# (Turing / GTX 1660) 原生 SASS 的 Windows x64 + CUDA 13.4 包。
+#
+# 与上游官方 win-cuda 包的差别：
+#   官方默认集是 75-virtual/80-virtual/90-virtual（sm_75 只有 PTX，
+#   首次加载由驱动 JIT），本包 -DCMAKE_CUDA_ARCHITECTURES=75 出真 SASS。
+#
+# 设计要点
+#  1. 只挂 workflow_dispatch，避免误触发。
+#  2. 源码锁定 env.UPSTREAM_REF（tag，不用 master），保证可复现。
+#  3. 不打任何补丁（Unicode 补丁是 K2-Horizon 分支专用，对上游不适用）。
+#  4. CUDA 13.4.1 GA 以 NVIDIA redist 归档免安装部署（Jimver/cuda-toolkit
+#     上限只到 13.3.1，不可用）。步骤内联，不用上游 action：上游那份在部分
+#     commit 只有 ARM64 分支、无 x64。
+#  5. ZIP 内不含 cudart/cublas 等 CUDA 运行时 DLL（与官方主包一致，需本机已装
+#     CUDA 13.x 或另取 cudart-llama-bin-win-cuda-*.zip）。
+#  6. 防覆盖上锁：if github.repository == 'womenlialtd/llama-sm75-builds'
+# =============================================================================
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: ggml-org/llama.cpp
+  UPSTREAM_REF: b11213
+  BUILD_LABEL: sm75-llama-b11213
+  CUDA_VERSION: '13.4'
+  CUDA_REDIST_BASE: https://developer.download.nvidia.com/compute/cuda/redist
+  CUDA_HOME_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4
+  ZIP_NAME: llama-b11213-bin-win-cuda13.4-sm75-x64.zip
+  CCACHE_VER: 4.10.2
+  CCACHE_DIR: ${{ github.workspace }}\.ccache
+  CCACHE_MAXSIZE: 500M
+
+jobs:
+  build:
+    if: github.repository == 'womenlialtd/llama-sm75-builds'
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      # -------------------------------------------------------------------------
+      # 检出上游固定 tag（不是本仓库）
+      # -------------------------------------------------------------------------
+      - name: Checkout upstream ${{ env.UPSTREAM_REF }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve build metadata
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          if ($sha -notmatch '^[0-9a-f]{40}$') { throw "cannot resolve commit sha (got '$sha')" }
+          "UPSTREAM_SHA=$sha"           | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "UPSTREAM_SHA_SHORT=$($sha.Substring(0,7))" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "source: $env:UPSTREAM_REPO@$sha (tag $env:UPSTREAM_REF)"
+          if (-not (Test-Path 'CMakeLists.txt')) { throw "checkout looks empty: no CMakeLists.txt" }
+
+      # -------------------------------------------------------------------------
+      # MSVC（windows-2022 自带 VS2022）
+      # -------------------------------------------------------------------------
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # -------------------------------------------------------------------------
+      # CUDA Toolkit 13.4（13.4.1 GA）x64 — redist 归档免安装部署
+      # 组件与版本串照抄上游 windows-setup-cuda 的 x64 分支，已验证 HTTP 200
+      # -------------------------------------------------------------------------
+      - name: Install CUDA Toolkit ${{ env.CUDA_VERSION }} (x64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dst = $env:CUDA_HOME_DIR
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+
+          $components = @(
+            'cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.4.59-archive.zip',
+            'cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.4.49-archive.zip',
+            'cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.4.59-archive.zip',
+            'cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.4.59-archive.zip',
+            'libcublas/windows-x86_64/libcublas-windows-x86_64-13.7.0.27-archive.zip',
+            'libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.4.59-archive.zip',
+            'cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.4.49-archive.zip',
+            'cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.4.49-archive.zip',
+            'visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.4.49-archive.zip',
+            'cccl/windows-x86_64/cccl-windows-x86_64-13.3.4.2.1-archive.zip'
+          )
+
+          $work  = Join-Path $env:RUNNER_TEMP 'cuda-dl'
+          $xdir  = Join-Path $env:RUNNER_TEMP 'cuda-x'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+          # 每个归档内部恰好一层 <组件>-windows-x86_64-<ver>-archive 目录。
+          # 合并进同一 CUDA_HOME 必须用 robocopy：Copy-Item -Recurse 遇到已存在
+          # 同名子目录会嵌套成 bin\bin（静默坏布局）。robocopy 退出码 0-7 均为成功。
+          foreach ($c in $components) {
+            $name = [IO.Path]::GetFileName($c)
+            $file = Join-Path $work $name
+            Write-Host "downloading $name"
+            curl.exe -sSL --fail --retry 3 -o "$file" "$env:CUDA_REDIST_BASE/$c"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $c" }
+
+            if (Test-Path $xdir) { Remove-Item $xdir -Recurse -Force }
+            New-Item -ItemType Directory -Force -Path $xdir | Out-Null
+            Expand-Archive -Path $file -DestinationPath $xdir -Force
+
+            $inner = @(Get-ChildItem -Path $xdir -Directory)
+            if ($inner.Count -lt 1) { throw "unexpected archive layout (no top dir): $name" }
+            $src = $inner[0].FullName
+            Write-Host "  merging $src -> $dst"
+            robocopy "$src" "$dst" /E /COPY:DAT /DCOPY:T /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Host
+            if ($LASTEXITCODE -gt 7) { throw "robocopy failed (exit $LASTEXITCODE) merging $name" }
+            $global:LASTEXITCODE = 0
+          }
+
+          Write-Host "=== CUDA_HOME top level ==="
+          Get-ChildItem $dst | Select-Object -ExpandProperty Name
+
+          if (-not (Test-Path (Join-Path $dst 'bin\nvcc.exe'))) { throw "nvcc.exe not found under $dst\bin" }
+          foreach ($must in @('include\cuda_runtime.h','lib\x64\cudart.lib','nvvm\bin\nvvm64.dll')) {
+            if (-not (Test-Path (Join-Path $dst $must))) { Write-Host "::warning::missing $must" }
+          }
+
+          $dst + '\bin'     | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $dst + '\libnvvp' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$dst"       | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CUDA_PATH_V13_4=$dst" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install ccache and Ninja
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "ccache-$env:CCACHE_VER-windows-x86_64.zip"
+          $url = "https://github.com/ccache/ccache/releases/download/v$env:CCACHE_VER/$zip"
+          New-Item -ItemType Directory -Force -Path 'C:\ccache' | Out-Null
+          curl.exe -sSL --fail --retry 3 -o "$env:RUNNER_TEMP\$zip" "$url"
+          if ($LASTEXITCODE -ne 0) { throw "ccache download failed: $url" }
+          Expand-Archive -Path "$env:RUNNER_TEMP\$zip" -DestinationPath 'C:\ccache\raw' -Force
+          $exe = Get-ChildItem -Path 'C:\ccache\raw' -Recurse -Filter ccache.exe | Select-Object -First 1
+          if (-not $exe) { throw "ccache.exe not found after extraction" }
+          Copy-Item $exe.FullName 'C:\ccache\ccache.exe' -Force
+          'C:\ccache' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja --no-progress -y }
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          nvcc --version
+          cmake --version | Select-Object -First 1
+          ninja --version
+          ccache --version
+          cl 2>&1 | Select-Object -First 1
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: sm75-win-cuda-${{ github.sha }}
+          restore-keys: |
+            sm75-win-cuda-
+
+      - name: Configure ccache
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:CCACHE_DIR | Out-Null
+          ccache --set-config=max_size=$env:CCACHE_MAXSIZE
+          ccache --set-config=cache_dir=$env:CCACHE_DIR
+          ccache --set-config=compression=true
+          ccache -z
+          ccache -s
+
+      # -------------------------------------------------------------------------
+      # 配置：CUDA 只编 arch 75（Turing / GTX 1660）→ 真 SASS，非 PTX-only
+      # GGML_NATIVE=OFF：runner 无 GPU 也无 CPU 侧探测，必须显式关
+      # GGML_CPU_ALL_VARIANTS：一次出全套 CPU 变体，运行期按 CPUID 选
+      # 所有 -D 选项已对 b11213 的 CMakeLists 逐个核对存在
+      # -------------------------------------------------------------------------
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_CUDA=ON `
+            -DGGML_RPC=ON `
+            -DGGML_OPENMP=OFF `
+            -DCMAKE_CUDA_ARCHITECTURES=75 `
+            -DLLAMA_OPENSSL=OFF `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_UI=OFF `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $jobs = [Math]::Max(1, [int]$env:NUMBER_OF_PROCESSORS - 1)
+          Write-Host "building with $jobs parallel jobs"
+          cmake --build build --config Release -j $jobs
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+
+      - name: Show ccache stats
+        shell: pwsh
+        run: ccache -s
+
+      # -------------------------------------------------------------------------
+      # 打包：Ninja Multi-Config 产物在 build\bin\Release\
+      # -------------------------------------------------------------------------
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $bin = Join-Path $env:GITHUB_WORKSPACE "build\bin\Release"
+          if (-not (Test-Path $bin)) {
+            Write-Host "::error::build output dir not found: $bin"
+            Get-ChildItem -Recurse -Directory -Path build\bin -ErrorAction SilentlyContinue | Select-Object FullName
+            throw "Build output not found"
+          }
+
+          Write-Host "=== raw build output ==="
+          Get-ChildItem -Path $bin -File | Select-Object Name, Length | Format-Table -AutoSize | Out-String -Width 200
+
+          foreach ($req in @('llama-cli.exe','llama-server.exe','ggml-cuda.dll','ggml.dll')) {
+            if (-not (Test-Path (Join-Path $bin $req))) { throw "required artifact missing: $req" }
+          }
+
+          # 排除 CUDA / cuDNN 运行时（与官方主包一致；cublas/cudart 由本机 CUDA 提供）
+          $exclude = '^(cudart|cublas|cublasLt|cufft|curand|nvrtc|nvJitLink|npp|npps|cudnn|cuinj)'
+
+          $stage = Join-Path $env:GITHUB_WORKSPACE ("dist\" + ($env:ZIP_NAME -replace '\.zip$',''))
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $kept = @(Get-ChildItem -Path $bin -File | Where-Object {
+            $_.Extension -in '.exe', '.dll' -and $_.Name -notmatch $exclude
+          })
+          $kept | Copy-Item -Destination $stage -Force
+          Write-Host "staged $($kept.Count) files"
+
+          $skipped = @(Get-ChildItem -Path $bin -File | Where-Object { $_.Extension -eq '.dll' -and $_.Name -match $exclude })
+          if ($skipped.Count -gt 0) { Write-Host "excluded CUDA runtime DLLs: $($skipped.Name -join ', ')" }
+
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE $env:ZIP_NAME
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
+
+          $mb = [Math]::Round((Get-Item $zipPath).Length / 1MB, 1)
+          Write-Host "=== final ZIP: $env:ZIP_NAME ($mb MB) ==="
+          Get-ChildItem $stage | Select-Object Name, Length | Format-Table -AutoSize | Out-String -Width 200
+
+          $summary = @(
+            '### llama.cpp sm_75 Windows CUDA 13.4'
+            "- source: ``$env:UPSTREAM_REPO`` @ ``$env:UPSTREAM_SHA_SHORT`` (tag ``$env:UPSTREAM_REF``)"
+            '- toolchain: CUDA ``13.4.1`` GA (redist), MSVC VS2022'
+            '- CUDA arch: ``75`` only -- native SASS for Turing / GTX 1660'
+            "- package: $env:ZIP_NAME ($mb MB, $($kept.Count) files)"
+            '- CUDA runtime DLLs intentionally excluded'
+          )
+          $summary | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+      # -------------------------------------------------------------------------
+      # 自动创建 / 更新 Release 并上传 ZIP（重跑 --clobber 覆盖）
+      # -------------------------------------------------------------------------
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          TAG="$BUILD_LABEL"
+          TITLE="llama.cpp $UPSTREAM_REF Windows CUDA 13.4 x64 — sm_75 (GTX 1660)"
+          cat > /tmp/release-notes.md <<EOF
+          ## llama.cpp $UPSTREAM_REF — Windows x64 + CUDA 13.4，只编 sm_75
+
+          | 项 | 值 |
+          |---|---|
+          | 源码 | \`ggml-org/llama.cpp\` tag \`$UPSTREAM_REF\` = \`$UPSTREAM_SHA\` |
+          | 编译器 | MSVC (VS2022, windows-2022 runner) |
+          | CUDA | Toolkit **13.4.1 GA**，NVIDIA redist 归档免安装部署 |
+          | CUDA 架构 | **仅 sm_75**（Turing / GTX 1660）**原生 SASS** |
+          | 补丁 | 无（上游原样构建） |
+          | 运行环境 | Windows 10/11 x64 |
+
+          ### 与官方 win-cuda 包的区别
+          官方 release 不传 \`CMAKE_CUDA_ARCHITECTURES\`，走上游默认集：
+          \`75-virtual / 80-virtual / 90-virtual\` —— 即 **sm_75 只带 PTX**，
+          首次加载由驱动 JIT 成 SASS。本包显式 \`-DCMAKE_CUDA_ARCHITECTURES=75\`，
+          直接产出 sm_75 真 SASS：免去驱动 JIT，包体也更小（官方 ggml-cuda.dll 约 147 MB，
+          本包约 52 MB）。稳态解码速度差异很小（JIT 与 nvcc 走同一后端），
+          主要收益是加载时间与体积。
+
+          **换非 Turing 显卡不可用** —— CUDA 后端没有其它架构的 kernel，
+          会静默回落到 CPU 变体。
+
+          ### ⚠️ 本包不含 CUDA 运行时 DLL
+          \`cudart64_*.dll\` / \`cublas64_*.dll\` / \`cublasLt64_*.dll\` 未打包（官方主包同样如此）。
+          - 本机已装 CUDA 13.x → 解压即用。
+          - 无 CUDA Toolkit → 需另取上游 \`cudart-llama-bin-win-cuda-13.4-x64.zip\`
+            或安装 CUDA 运行时，放到 exe 同目录。
+
+          ### 验收要点
+          \`GGML_BACKEND_DL=ON\` 意味着后端 DLL 缺失只在**运行期**静默降级，
+          zip 完整不等于跑在 GPU 上。请确认日志出现
+          \`load_backend: loaded CUDA backend\` 且设备为 GTX 1660，再跑 \`llama-bench\`。
+
+          ### GTX 1660 6 GB 提示
+          7B 模型建议 Q3/Q4 量化，并压低 \`-c/--ctx-size\` 与 KV 缓存
+          （如 \`-ctk f16 -ctv f16\` 或 \`q8_0\`），否则容易 OOM。
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists -> uploading asset with --clobber"
+            gh release upload "$TAG" "$ZIP_NAME" --clobber
+          else
+            gh release create "$TAG" "$ZIP_NAME" \
+              --title "$TITLE" \
+              --notes-file /tmp/release-notes.md \
+              --latest=false
+          fi
+          gh release view "$TAG" --json tagName,assets,url --jq '{tag:.tagName,url:.url,assets:[.assets[].name]}'
