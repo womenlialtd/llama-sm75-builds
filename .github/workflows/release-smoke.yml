@@ -1,0 +1,45 @@
+name: release-step smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      UPSTREAM_REPO: ggml-org/llama.cpp
+    steps:
+      # Mirror the real failure condition: CWD git origin points at the *upstream* repo.
+      - name: Checkout upstream (origin = ggml-org/llama.cpp)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: b11213
+          fetch-depth: 1
+
+      - name: Prove root cause and fix
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=sm75-llama-b11213
+          echo "--- 1) WITHOUT --repo (the old buggy form) ---"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "UNEXPECTED: no --repo still worked -> diagnosis wrong"
+          else
+            echo "REPRODUCED: gh resolved to: $(gh api repos/ggml-org/llama.cpp/releases 2>&1 | head -1)"
+            gh release view "$TAG" 2>&1 | head -2
+          fi
+          echo
+          echo "--- 2) WITH --repo \"\$GITHUB_REPOSITORY\" (the fix) ---"
+          REPO="$GITHUB_REPOSITORY"
+          echo "GITHUB_REPOSITORY = $REPO"
+          gh release view "$TAG" --repo "$REPO" \
+            --json tagName,assets,url --jq '{tag:.tagName,url:.url,assets:[.assets[].name]}'
+          echo
+          echo "--- 3) which repo did gh infer from CWD? ---"
+          gh repo view --json nameWithOwner --jq .nameWithOwner 2>&1 | head -2
