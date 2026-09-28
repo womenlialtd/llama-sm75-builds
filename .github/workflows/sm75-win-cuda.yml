@@ -18,7 +18,8 @@ name: llama.cpp Windows CUDA sm_75 Build
 #     commit 只有 ARM64 分支、无 x64。
 #  5. ZIP 内不含 cudart/cublas 等 CUDA 运行时 DLL（与官方主包一致，需本机已装
 #     CUDA 13.x 或另取 cudart-llama-bin-win-cuda-*.zip）。
-#  6. 防覆盖上锁：if github.repository == 'womenlialtd/llama-sm75-builds'
+#  6. 防覆盖上锁：if github.repository_owner == 'womenlialtd'
+#     （用 owner 而非仓库全名，这样仓库改名后 job 不会静默变 skipped）
 # =============================================================================
 
 on:
@@ -41,7 +42,9 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'womenlialtd/llama-sm75-builds'
+    # 按 owner 判断而非仓库全名：仓库改名后不会静默把 job 变成 skipped
+    # （失配时 run 整体仍显示 success，只是零产物 —— 最难察觉的失败模式）
+    if: github.repository_owner == 'womenlialtd'
     runs-on: windows-2022
     timeout-minutes: 360
 
